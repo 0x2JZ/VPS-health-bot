@@ -12,16 +12,20 @@ ENV_FILE=${VPS_WATCHDOG_CONFIG:-/etc/vps-watchdog/config.env}
 : "${TG_BOT_TOKEN:?TG_BOT_TOKEN not set in $ENV_FILE}"
 : "${TG_CHAT_ID:?TG_CHAT_ID not set in $ENV_FILE}"
 
-MSG="${1:-}"
+# --force anywhere in the args bypasses the mute flag (works with stdin too).
+FORCE=no
+MSG=""
+for arg in "$@"; do
+  if [ "$arg" = "--force" ]; then FORCE=yes; else MSG="$arg"; fi
+done
 if [ -z "$MSG" ]; then
   MSG="$(cat)"
 fi
 [ -n "$MSG" ] || { echo "tg-notify: empty message" >&2; exit 1; }
 
 # Mute flag: bot writes an epoch timestamp; suppress alerts until then.
-# Pass --force (as $2 or $1) to bypass, e.g. for the unmute confirmation itself.
 MUTE_FILE=/var/lib/vps-watchdog/mute-until
-if [ "${2:-}" != "--force" ] && [ -r "$MUTE_FILE" ]; then
+if [ "$FORCE" = "no" ] && [ -r "$MUTE_FILE" ]; then
   MUTE_UNTIL=$(cat "$MUTE_FILE" 2>/dev/null || echo 0)
   if [ "$(date +%s)" -lt "${MUTE_UNTIL:-0}" ] 2>/dev/null; then
     exit 0
@@ -34,9 +38,14 @@ if [ "${#MSG}" -gt 4000 ]; then
 ... [truncated]"
 fi
 
-curl -sS --max-time 15 -X POST \
+# Telegram returns HTTP 200 with {"ok":false,...} on errors (bad chat id,
+# revoked token) — check the body, not just the curl exit code.
+RESP=$(curl -sS --max-time 15 -X POST \
   "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
   --data-urlencode "chat_id=${TG_CHAT_ID}" \
   --data-urlencode "text=${MSG}" \
-  --data-urlencode "disable_web_page_preview=true" \
-  >/dev/null
+  --data-urlencode "disable_web_page_preview=true") || exit 1
+case "$RESP" in
+  '{"ok":true'*) exit 0 ;;
+  *) echo "tg-notify: telegram API error: $RESP" >&2; exit 1 ;;
+esac

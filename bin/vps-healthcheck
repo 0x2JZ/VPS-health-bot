@@ -13,10 +13,15 @@ ENV_FILE=${VPS_WATCHDOG_CONFIG:-/etc/vps-watchdog/config.env}
 # shellcheck disable=SC1090
 [ -r "$ENV_FILE" ] && . "$ENV_FILE"
 
+# Serialize runs (cron + on-demand from the bot can overlap).
+exec 9>/run/vps-healthcheck.lock
+flock -n 9 || exit 0
+
 STATE_DIR=/var/lib/vps-watchdog
 STATE_FILE="$STATE_DIR/state"
 HOST=$(hostname -s)
 mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
 touch "$STATE_FILE"
 
 DISK_THRESHOLD=${DISK_THRESHOLD:-85}
@@ -41,7 +46,10 @@ write_state() {
 }
 
 handle() {
-  local key=$1 new=$2 fail_msg=$3 ok_msg=$4
+  # Keys become grep patterns and state-file fields — strip anything unsafe
+  # (service names like postgresql@14-main, domains with dots).
+  local key; key=$(printf '%s' "$1" | tr -c 'A-Za-z0-9_' '_')
+  local new=$2 fail_msg=$3 ok_msg=$4
   local old; old=$(prev_state "$key")
   local last_t; last_t=$(prev_time "$key")
   [ -z "$old" ] && old=OK
@@ -71,18 +79,18 @@ try:
   data = json.load(sys.stdin)
 except Exception:
   print("PARSE_ERROR|"); sys.exit(0)
-lines, bad = [], []
+lines, bad, seen = [], [], set()
 for p in data:
   name = p.get("name", "?")
   if watch and name not in watch:
     continue
+  seen.add(name)
   st = (p.get("pm2_env") or {}).get("status", "?")
   restarts = (p.get("pm2_env") or {}).get("restart_time", 0)
   emoji = "🟢" if st == "online" else "🔴"
   lines.append("{} {} ({}, ↺{})".format(emoji, name, st, restarts))
   if st != "online":
     bad.append("{}={}".format(name, st))
-seen = {l.split()[1] for l in lines}
 for w in sorted(watch - seen):
   lines.append("🔴 {} (missing)".format(w)); bad.append("{}=missing".format(w))
 status = "OK" if not bad else "FAIL"
@@ -94,7 +102,14 @@ print("{}|{}|{}".format(status, ", ".join(bad), "\n".join(lines)))
   PM2_DOWN=${PM2_REST%%|*}
   PM2_DETAILS=${PM2_REST#*|}
 
-  if [ "$PM2_STATUS" = "PARSE_ERROR" ] || [ -z "$PM2_OUT" ]; then
+  # An empty process list is only "cannot read" when the user explicitly
+  # opted in (MONITOR_PM2=yes) or named processes to watch (missing-detection
+  # covers that case); with auto + no watch list, an empty pm2 is not an error.
+  EMPTY_IS_FAIL=no
+  [ "$MONITOR_PM2" = "yes" ] && [ -z "$PM2_PROCESSES" ] && EMPTY_IS_FAIL=yes
+
+  if [ "$PM2_STATUS" = "PARSE_ERROR" ] || [ -z "$PM2_OUT" ] || \
+     { [ "$EMPTY_IS_FAIL" = "yes" ] && [ "$PM2_OUT" = "[]" ]; }; then
     handle pm2 FAIL \
       "🚨 VPS ALERT — $HOST
 🔴 PM2: cannot read process list
@@ -141,9 +156,10 @@ done
 # 3. Disk ---------------------------------------------------------------------
 USED=$(df --output=pcent / | tail -1 | tr -dc '0-9')
 DISK_LINE=$(df -h / | tail -1 | awk '{print $3"/"$2" used ("$5"), "$4" free"}')
-TOP_DIRS=$(du -sh /var/log /var/lib /opt /home /tmp 2>/dev/null | sort -rh | head -3 | awk '{print "  • " $0}')
 
 if [ "${USED:-0}" -ge "$DISK_THRESHOLD" ]; then
+  # du is expensive — only walk the tree when we're actually over threshold
+  TOP_DIRS=$(du -sh /var/log /var/lib /opt /home /tmp 2>/dev/null | sort -rh | head -3 | awk '{print "  • " $0}')
   handle disk FAIL \
     "🚨 VPS ALERT — $HOST
 💾 Disk near full

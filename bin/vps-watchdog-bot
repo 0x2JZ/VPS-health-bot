@@ -87,8 +87,11 @@ def edit(chat_id, message_id, text, keyboard=None):
     if keyboard:
         params["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
     r = api_call("editMessageText", params, timeout=20)
-    if not (r or {}).get("ok"):  # message too old / unchanged — send fresh
-        send(chat_id, text, keyboard)
+    if r and not r.get("ok"):
+        # Unchanged content is fine (e.g. Refresh within the same minute);
+        # anything else (message too old, deleted) → send a fresh message.
+        if "not modified" not in r.get("description", ""):
+            send(chat_id, text, keyboard)
 
 
 def answer_cb(cb_id, text=""):
@@ -182,11 +185,23 @@ def read_ips():
         return []
 
 
-def write_ips(ips):
+def add_ip(ip):
     os.makedirs(os.path.dirname(KNOWN_IPS_FILE), exist_ok=True)
+    with open(KNOWN_IPS_FILE, "a") as f:
+        f.write(ip + "\n")
+
+
+def remove_ip(ip):
+    """Drop only the matching IP line; comments and other lines survive."""
+    try:
+        with open(KNOWN_IPS_FILE) as f:
+            lines = f.readlines()
+    except OSError:
+        return
+    kept = [l for l in lines if l.strip() != ip]
     tmp = KNOWN_IPS_FILE + ".tmp"
     with open(tmp, "w") as f:
-        f.write("\n".join(ips) + ("\n" if ips else ""))
+        f.writelines(kept)
     os.replace(tmp, KNOWN_IPS_FILE)
 
 
@@ -358,9 +373,8 @@ def handle_callback(cb):
              [[{"text": "⬅️ Cancel", "callback_data": "whitelist"}]])
     elif data.startswith("wl_rm:"):
         ip = data.split(":", 1)[1]
-        ips = read_ips()
-        if ip in ips:
-            ips.remove(ip); write_ips(ips)
+        if ip in read_ips():
+            remove_ip(ip)
         t, kb = whitelist_view(); edit(chat_id, msg_id, f"🗑 Removed {ip}.\n\n{t}", kb)
     elif data == "logins":
         edit(chat_id, msg_id, fmt_logins(),
@@ -419,11 +433,10 @@ def handle_message(msg):
         if not valid_ip(ip):
             send(chat_id, f"❌ '{ip}' is not a valid IP address. Try again from the menu.")
         else:
-            ips = read_ips()
-            if ip in ips:
+            if ip in read_ips():
                 send(chat_id, f"ℹ️ {ip} is already whitelisted.")
             else:
-                write_ips(ips + [ip])
+                add_ip(ip)
                 send(chat_id, f"✅ Added {ip} to the whitelist.")
         t, kb = whitelist_view(); send(chat_id, t, kb)
         return

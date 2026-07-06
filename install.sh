@@ -13,6 +13,7 @@ install -m 755 bin/tg-notify bin/vps-healthcheck bin/vps-integrity-check \
 
 echo "==> Creating /etc/vps-watchdog"
 mkdir -p /etc/vps-watchdog /var/lib/vps-watchdog
+chmod 700 /var/lib/vps-watchdog   # holds copies of watched files (incl. /etc/shadow)
 if [ ! -f /etc/vps-watchdog/config.env ]; then
   install -m 600 config/config.env.example /etc/vps-watchdog/config.env
   echo "    created /etc/vps-watchdog/config.env — EDIT IT with your bot token + chat id"

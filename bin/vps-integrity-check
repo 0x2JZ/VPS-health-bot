@@ -10,9 +10,16 @@ ENV_FILE=${VPS_WATCHDOG_CONFIG:-/etc/vps-watchdog/config.env}
 # shellcheck disable=SC1090
 [ -r "$ENV_FILE" ] && . "$ENV_FILE"
 
+# Serialize runs (cron + on-demand from the bot can overlap).
+exec 9>/run/vps-integrity-check.lock
+flock -n 9 || exit 0
+
 STATE_DIR=/var/lib/vps-watchdog/integrity
 HOST=$(hostname -s)
+# State holds verbatim copies of /etc/shadow etc. — must not be world-readable.
 mkdir -p "$STATE_DIR"
+chmod 700 /var/lib/vps-watchdog "$STATE_DIR"
+umask 077
 
 # Files to fingerprint. Each file is hashed; we track full content so we can diff.
 WATCH_FILES=(

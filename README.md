@@ -91,7 +91,11 @@ State lives in `/var/lib/vps-watchdog/`. Uninstall with `sudo bash uninstall.sh`
   and `.gitignore` blocks committing real config from a repo checkout.
 - The bot answers **only** the chat ids you configure; everyone else gets
   silently ignored (callbacks answered "unauthorized").
+- Use your **private** chat id, not a group id — in a group, every member of
+  the group would be able to control the bot.
 - Service restarts from the bot are **off by default**.
+- State in `/var/lib/vps-watchdog` is `chmod 700` — the integrity checker
+  keeps content snapshots of watched files (including `/etc/shadow`) there.
 
 ## License
 
