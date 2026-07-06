@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+"""vps-watchdog-bot — interactive Telegram menu for the VPS watchdog.
+
+Long-polls the Telegram Bot API (stdlib only, no pip packages) and offers a
+button-driven menu: live status, IP whitelist management, recent SSH logins,
+fail2ban view/unban, service status/restart, disk usage, alert muting, and
+on-demand health/integrity checks.
+
+Only the chat ids in TG_CHAT_ID / TG_ADMIN_IDS may use it; everyone else is
+silently ignored. Runs as a systemd service (vps-watchdog-bot.service).
+"""
+
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONFIG_FILE = os.environ.get("VPS_WATCHDOG_CONFIG", "/etc/vps-watchdog/config.env")
+STATE_DIR = "/var/lib/vps-watchdog"
+OFFSET_FILE = os.path.join(STATE_DIR, "bot-offset")
+MUTE_FILE = os.path.join(STATE_DIR, "mute-until")
+
+
+# --------------------------------------------------------------------------- config
+
+def load_config():
+    cfg = {}
+    try:
+        with open(CONFIG_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError as e:
+        sys.exit(f"cannot read {CONFIG_FILE}: {e}")
+    if not cfg.get("TG_BOT_TOKEN") or not cfg.get("TG_CHAT_ID"):
+        sys.exit(f"TG_BOT_TOKEN / TG_CHAT_ID not set in {CONFIG_FILE}")
+    return cfg
+
+
+CFG = load_config()
+TOKEN = CFG["TG_BOT_TOKEN"]
+ADMIN_IDS = {CFG["TG_CHAT_ID"]} | set(CFG.get("TG_ADMIN_IDS", "").split())
+KNOWN_IPS_FILE = CFG.get("KNOWN_IPS_FILE", "/etc/vps-watchdog/known-ips")
+ALLOW_RESTART = CFG.get("ALLOW_SERVICE_RESTART", "no").lower() == "yes"
+ALLOW_UNBAN = CFG.get("ALLOW_FAIL2BAN_UNBAN", "yes").lower() == "yes"
+API = f"https://api.telegram.org/bot{TOKEN}"
+HOST = os.uname().nodename.split(".")[0]
+
+# chat_id -> pending action (e.g. "add_ip")
+PENDING = {}
+
+
+# --------------------------------------------------------------------------- telegram api
+
+def api_call(method, params=None, timeout=60):
+    data = urllib.parse.urlencode(params or {}).encode()
+    req = urllib.request.Request(f"{API}/{method}", data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+        print(f"api {method} failed: {e}", file=sys.stderr)
+        return None
+
+
+def send(chat_id, text, keyboard=None):
+    params = {"chat_id": chat_id, "text": text[:4000],
+              "disable_web_page_preview": "true"}
+    if keyboard:
+        params["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
+    return api_call("sendMessage", params, timeout=20)
+
+
+def edit(chat_id, message_id, text, keyboard=None):
+    params = {"chat_id": chat_id, "message_id": message_id, "text": text[:4000],
+              "disable_web_page_preview": "true"}
+    if keyboard:
+        params["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
+    r = api_call("editMessageText", params, timeout=20)
+    if not (r or {}).get("ok"):  # message too old / unchanged — send fresh
+        send(chat_id, text, keyboard)
+
+
+def answer_cb(cb_id, text=""):
+    api_call("answerCallbackQuery", {"callback_query_id": cb_id, "text": text[:190]},
+             timeout=10)
+
+
+# --------------------------------------------------------------------------- shell helpers
+
+def sh(cmd, timeout=30):
+    """Run a shell command, return stdout ('' on any failure)."""
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           timeout=timeout)
+        return r.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+
+
+def have(binary):
+    return shutil.which(binary) is not None
+
+
+# --------------------------------------------------------------------------- feature: status
+
+def fmt_status():
+    up = sh("uptime -p").replace("up ", "")
+    disk = sh("df -h / | tail -1 | awk '{print $3\"/\"$2\" (\"$5\")\"}'")
+    disk_pct = sh("df --output=pcent / | tail -1 | tr -dc '0-9'")
+    mem = sh("free -h | awk '/Mem:/ {print $3\"/\"$2}'")
+    mem_pct = sh("free | awk '/Mem:/ {printf \"%d\", $3/$2*100}'")
+    load = sh("awk '{print $1\", \"$2\", \"$3}' /proc/loadavg")
+    sessions = sh("who | wc -l")
+
+    lines = [f"📊 LIVE STATUS — {HOST}",
+             f"🕒 {time.strftime('%Y-%m-%d %H:%M %Z')}",
+             f"⏱ Uptime: {up}",
+             "",
+             f"💾 Disk /: {disk}",
+             f"🧠 Mem: {mem} ({mem_pct}%)  •  📈 Load: {load}",
+             f"👥 Active SSH sessions: {sessions}"]
+
+    svc = fmt_service_lines()
+    if svc:
+        lines += ["", "Services:"] + svc
+
+    for domain in CFG.get("TLS_DOMAINS", "").split():
+        cert = f"/etc/letsencrypt/live/{domain}/fullchain.pem"
+        if os.path.isfile(cert):
+            end = sh(f"date -d \"$(openssl x509 -in {cert} -noout -enddate | cut -d= -f2)\" +%s")
+            if end.isdigit():
+                days = (int(end) - int(time.time())) // 86400
+                emoji = "🔐" if days > 14 else "🚨"
+                lines.append(f"{emoji} TLS {domain}: {days} days left")
+
+    if have("fail2ban-client"):
+        banned = sh("fail2ban-client status sshd 2>/dev/null | awk -F'\\t+' '/Currently banned/ {print $2}'")
+        lines.append(f"🛡 fail2ban (sshd): {banned or '0'} banned now")
+
+    mute = mute_status()
+    if mute:
+        lines += ["", mute]
+    return "\n".join(lines)
+
+
+def fmt_service_lines():
+    out = []
+    if have("pm2"):
+        raw = sh("pm2 jlist", timeout=20)
+        try:
+            for p in json.loads(raw or "[]"):
+                st = (p.get("pm2_env") or {}).get("status", "?")
+                emoji = "🟢" if st == "online" else "🔴"
+                out.append(f"{emoji} pm2/{p.get('name', '?')} ({st})")
+        except json.JSONDecodeError:
+            out.append("❓ pm2: unreadable")
+    for svc in CFG.get("SYSTEMD_SERVICES", "").split():
+        st = sh(f"systemctl is-active {svc}") or "unknown"
+        emoji = "🟢" if st == "active" else "🔴"
+        out.append(f"{emoji} systemd/{svc} ({st})")
+    return out
+
+
+# --------------------------------------------------------------------------- feature: whitelist
+
+def read_ips():
+    try:
+        with open(KNOWN_IPS_FILE) as f:
+            return [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+    except OSError:
+        return []
+
+
+def write_ips(ips):
+    os.makedirs(os.path.dirname(KNOWN_IPS_FILE), exist_ok=True)
+    tmp = KNOWN_IPS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(ips) + ("\n" if ips else ""))
+    os.replace(tmp, KNOWN_IPS_FILE)
+
+
+def whitelist_view():
+    ips = read_ips()
+    text = f"🌐 IP WHITELIST — {HOST}\n"
+    text += "Logins from these IPs alert as ✅ trusted; all others as 🚨 unknown.\n\n"
+    text += "\n".join(f"• {ip}" for ip in ips) if ips else "(empty)"
+    kb = [[{"text": f"🗑 remove {ip}", "callback_data": f"wl_rm:{ip}"}] for ip in ips[:20]]
+    kb.append([{"text": "➕ Add IP", "callback_data": "wl_add"},
+               {"text": "⬅️ Menu", "callback_data": "menu"}])
+    return text, kb
+
+
+def valid_ip(s):
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+# --------------------------------------------------------------------------- feature: logins / fail2ban / disk
+
+def fmt_logins():
+    raw = sh("grep -E 'Accepted (password|publickey)' /var/log/auth.log | tail -8")
+    lines = [f"👥 RECENT SSH LOGINS — {HOST}", ""]
+    known = set(read_ips())
+    for l in raw.splitlines():
+        m = re.search(r"^(\S+\s+\S+\s+\S+).*Accepted (\w+) for (\S+) from (\S+)", l)
+        if m:
+            ts, method, user, ip = m.groups()
+            mark = "✅" if ip in known else "🚨"
+            lines.append(f"{mark} {ts} — {user} from {ip} ({method})")
+    if len(lines) == 2:
+        lines.append("(none in current auth.log)")
+    active = sh("who")
+    lines += ["", f"Active now:", active or "(none)"]
+    return "\n".join(lines)
+
+
+def fmt_fail2ban():
+    if not have("fail2ban-client"):
+        return "🛡 fail2ban is not installed.", [[{"text": "⬅️ Menu", "callback_data": "menu"}]]
+    raw = sh("fail2ban-client status sshd 2>/dev/null")
+    banned = re.search(r"Banned IP list:\s*(.*)", raw)
+    ips = banned.group(1).split() if banned else []
+    text = f"🛡 FAIL2BAN (sshd) — {HOST}\n\n{raw or '(no output)'}"
+    kb = []
+    if ALLOW_UNBAN:
+        kb = [[{"text": f"🔓 unban {ip}", "callback_data": f"f2b_unban:{ip}"}] for ip in ips[:15]]
+    kb.append([{"text": "⬅️ Menu", "callback_data": "menu"}])
+    return text, kb
+
+
+def fmt_disk():
+    df = sh("df -h / /var 2>/dev/null | sort -u")
+    top = sh("du -sh /var/log /var/lib /opt /home /tmp 2>/dev/null | sort -rh | head -6")
+    return f"💾 DISK — {HOST}\n\n{df}\n\nTop consumers:\n{top}"
+
+
+# --------------------------------------------------------------------------- feature: services
+
+def services_view():
+    lines = fmt_service_lines()
+    text = f"⚙️ SERVICES — {HOST}\n\n" + ("\n".join(lines) if lines else "(none detected/configured)")
+    kb = []
+    if ALLOW_RESTART:
+        if have("pm2"):
+            raw = sh("pm2 jlist", timeout=20)
+            try:
+                for p in json.loads(raw or "[]"):
+                    n = p.get("name", "?")
+                    kb.append([{"text": f"🔄 restart pm2/{n}", "callback_data": f"svc_ask:pm2:{n}"}])
+            except json.JSONDecodeError:
+                pass
+        for svc in CFG.get("SYSTEMD_SERVICES", "").split():
+            kb.append([{"text": f"🔄 restart {svc}", "callback_data": f"svc_ask:sysd:{svc}"}])
+    else:
+        text += "\n\n(restarts disabled — set ALLOW_SERVICE_RESTART=yes to enable)"
+    kb.append([{"text": "⬅️ Menu", "callback_data": "menu"}])
+    return text, kb
+
+
+# --------------------------------------------------------------------------- feature: mute
+
+def mute_status():
+    try:
+        until = int(open(MUTE_FILE).read().strip())
+    except (OSError, ValueError):
+        return ""
+    if until > time.time():
+        return f"🔇 Alerts muted until {time.strftime('%H:%M %Z', time.localtime(until))}"
+    return ""
+
+
+def mute_view():
+    text = f"🔇 MUTE ALERTS — {HOST}\n\nSuppress cron/PAM alerts (the bot menu keeps working).\n"
+    text += "\n" + (mute_status() or "🔔 Alerts are ON.")
+    kb = [[{"text": "1h", "callback_data": "mute:3600"},
+           {"text": "6h", "callback_data": "mute:21600"},
+           {"text": "24h", "callback_data": "mute:86400"},
+           {"text": "🔔 Unmute", "callback_data": "mute:0"}],
+          [{"text": "⬅️ Menu", "callback_data": "menu"}]]
+    return text, kb
+
+
+def set_mute(seconds):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if seconds <= 0:
+        try:
+            os.remove(MUTE_FILE)
+        except OSError:
+            pass
+        return "🔔 Alerts unmuted."
+    with open(MUTE_FILE, "w") as f:
+        f.write(str(int(time.time()) + seconds))
+    return f"🔇 Alerts muted for {seconds // 3600}h."
+
+
+# --------------------------------------------------------------------------- menu
+
+def main_menu():
+    text = (f"🤖 VPS WATCHDOG — {HOST}\n"
+            f"🕒 {time.strftime('%Y-%m-%d %H:%M %Z')}\n\n"
+            "Pick an action:")
+    m = mute_status()
+    if m:
+        text += f"\n\n{m}"
+    kb = [
+        [{"text": "📊 Status", "callback_data": "status"},
+         {"text": "💾 Disk", "callback_data": "disk"}],
+        [{"text": "🌐 Whitelist", "callback_data": "whitelist"},
+         {"text": "👥 Logins", "callback_data": "logins"}],
+        [{"text": "🛡 fail2ban", "callback_data": "f2b"},
+         {"text": "⚙️ Services", "callback_data": "services"}],
+        [{"text": "▶️ Run checks now", "callback_data": "runchecks"},
+         {"text": "🔇 Mute", "callback_data": "mute_menu"}],
+    ]
+    return text, kb
+
+
+BACK = [[{"text": "⬅️ Menu", "callback_data": "menu"}, {"text": "🔄 Refresh", "callback_data": "status"}]]
+
+
+# --------------------------------------------------------------------------- dispatch
+
+def handle_callback(cb):
+    chat_id = str(cb["message"]["chat"]["id"])
+    msg_id = cb["message"]["message_id"]
+    data = cb.get("data", "")
+    answer_cb(cb["id"])
+
+    if data == "menu":
+        PENDING.pop(chat_id, None)
+        t, kb = main_menu(); edit(chat_id, msg_id, t, kb)
+    elif data == "status":
+        edit(chat_id, msg_id, fmt_status(), BACK)
+    elif data == "disk":
+        edit(chat_id, msg_id, fmt_disk(),
+             [[{"text": "⬅️ Menu", "callback_data": "menu"},
+               {"text": "🔄 Refresh", "callback_data": "disk"}]])
+    elif data == "whitelist":
+        t, kb = whitelist_view(); edit(chat_id, msg_id, t, kb)
+    elif data == "wl_add":
+        PENDING[chat_id] = "add_ip"
+        edit(chat_id, msg_id, "➕ Send the IP address to whitelist (IPv4 or IPv6).\n"
+                              "Send /cancel to abort.",
+             [[{"text": "⬅️ Cancel", "callback_data": "whitelist"}]])
+    elif data.startswith("wl_rm:"):
+        ip = data.split(":", 1)[1]
+        ips = read_ips()
+        if ip in ips:
+            ips.remove(ip); write_ips(ips)
+        t, kb = whitelist_view(); edit(chat_id, msg_id, f"🗑 Removed {ip}.\n\n{t}", kb)
+    elif data == "logins":
+        edit(chat_id, msg_id, fmt_logins(),
+             [[{"text": "⬅️ Menu", "callback_data": "menu"},
+               {"text": "🔄 Refresh", "callback_data": "logins"}]])
+    elif data == "f2b":
+        t, kb = fmt_fail2ban(); edit(chat_id, msg_id, t, kb)
+    elif data.startswith("f2b_unban:") and ALLOW_UNBAN:
+        ip = data.split(":", 1)[1]
+        if valid_ip(ip):
+            sh(f"fail2ban-client set sshd unbanip {ip}")
+        t, kb = fmt_fail2ban(); edit(chat_id, msg_id, f"🔓 Unbanned {ip}.\n\n{t}", kb)
+    elif data == "services":
+        t, kb = services_view(); edit(chat_id, msg_id, t, kb)
+    elif data.startswith("svc_ask:") and ALLOW_RESTART:
+        _, kind, name = data.split(":", 2)
+        edit(chat_id, msg_id, f"⚠️ Restart {kind}/{name} — are you sure?",
+             [[{"text": "✅ Yes, restart", "callback_data": f"svc_do:{kind}:{name}"},
+               {"text": "❌ No", "callback_data": "services"}]])
+    elif data.startswith("svc_do:") and ALLOW_RESTART:
+        _, kind, name = data.split(":", 2)
+        if not re.fullmatch(r"[A-Za-z0-9@._-]+", name):
+            edit(chat_id, msg_id, "❌ Invalid service name.", BACK); return
+        if kind == "pm2":
+            sh(f"pm2 restart {name}", timeout=60)
+        else:
+            sh(f"systemctl restart {name}", timeout=60)
+        time.sleep(2)
+        t, kb = services_view(); edit(chat_id, msg_id, f"🔄 Restarted {name}.\n\n{t}", kb)
+    elif data == "runchecks":
+        edit(chat_id, msg_id, "▶️ Running health + integrity checks…")
+        sh("/usr/local/bin/vps-healthcheck", timeout=120)
+        sh("/usr/local/bin/vps-integrity-check", timeout=120)
+        edit(chat_id, msg_id,
+             "✅ Checks done. Any OK→FAIL transitions or integrity changes were "
+             "alerted separately (silence = all good).\n\n" + fmt_status(), BACK)
+    elif data == "mute_menu":
+        t, kb = mute_view(); edit(chat_id, msg_id, t, kb)
+    elif data.startswith("mute:"):
+        note = set_mute(int(data.split(":")[1]))
+        t, kb = mute_view(); edit(chat_id, msg_id, f"{note}\n\n{t}", kb)
+
+
+def handle_message(msg):
+    chat_id = str(msg["chat"]["id"])
+    text = (msg.get("text") or "").strip()
+
+    if text == "/cancel":
+        PENDING.pop(chat_id, None)
+        t, kb = main_menu(); send(chat_id, f"Cancelled.\n\n{t}", kb)
+        return
+
+    if PENDING.get(chat_id) == "add_ip":
+        PENDING.pop(chat_id, None)
+        ip = text
+        if not valid_ip(ip):
+            send(chat_id, f"❌ '{ip}' is not a valid IP address. Try again from the menu.")
+        else:
+            ips = read_ips()
+            if ip in ips:
+                send(chat_id, f"ℹ️ {ip} is already whitelisted.")
+            else:
+                write_ips(ips + [ip])
+                send(chat_id, f"✅ Added {ip} to the whitelist.")
+        t, kb = whitelist_view(); send(chat_id, t, kb)
+        return
+
+    if text.startswith("/status"):
+        send(chat_id, fmt_status(), BACK)
+    elif text.startswith("/whitelist"):
+        t, kb = whitelist_view(); send(chat_id, t, kb)
+    elif text.startswith("/mute"):
+        t, kb = mute_view(); send(chat_id, t, kb)
+    else:  # /start, /menu, /help, anything else
+        t, kb = main_menu(); send(chat_id, t, kb)
+
+
+# --------------------------------------------------------------------------- main loop
+
+def load_offset():
+    try:
+        return int(open(OFFSET_FILE).read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def save_offset(offset):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(OFFSET_FILE, "w") as f:
+        f.write(str(offset))
+
+
+def main():
+    print(f"vps-watchdog-bot starting (admins: {', '.join(sorted(ADMIN_IDS))})")
+    offset = load_offset()
+    while True:
+        resp = api_call("getUpdates", {"offset": offset + 1, "timeout": 50},
+                        timeout=70)
+        if not resp or not resp.get("ok"):
+            time.sleep(5)
+            continue
+        for upd in resp.get("result", []):
+            offset = max(offset, upd["update_id"])
+            save_offset(offset)
+            try:
+                if "callback_query" in upd:
+                    cb = upd["callback_query"]
+                    if str(cb["message"]["chat"]["id"]) in ADMIN_IDS:
+                        handle_callback(cb)
+                    else:
+                        answer_cb(cb["id"], "unauthorized")
+                elif "message" in upd:
+                    if str(upd["message"]["chat"]["id"]) in ADMIN_IDS:
+                        handle_message(upd["message"])
+            except Exception as e:  # keep the loop alive on any handler bug
+                print(f"handler error: {e}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

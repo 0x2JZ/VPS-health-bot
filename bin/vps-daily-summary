@@ -1,0 +1,111 @@
+#!/bin/bash
+# vps-daily-summary — sends a once-a-day Telegram digest of VPS health.
+# Run from /etc/cron.d/vps-watchdog (default 09:00 local).
+
+set -u
+ENV_FILE=${VPS_WATCHDOG_CONFIG:-/etc/vps-watchdog/config.env}
+# shellcheck disable=SC1090
+[ -r "$ENV_FILE" ] && . "$ENV_FILE"
+
+HOST=$(hostname -s)
+DATE=$(date '+%Y-%m-%d %H:%M %Z')
+UPTIME=$(uptime -p | sed 's/up //')
+TLS_DOMAINS=${TLS_DOMAINS:-}
+
+# Disk + memory + load
+DISK_USED=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+DISK_LINE=$(df -h / | tail -1 | awk '{print $3"/"$2" ("$5")"}')
+MEM_LINE=$(free -h | awk '/Mem:/ {print $3"/"$2}')
+LOAD=$(awk '{print $1", "$2", "$3}' /proc/loadavg)
+
+# PM2 (skipped if not installed)
+PM2_LINE=""
+if command -v pm2 >/dev/null 2>&1; then
+  PM2_LINE=$(pm2 jlist 2>/dev/null | python3 -c '
+import sys, json
+try:
+  d = json.load(sys.stdin)
+except Exception:
+  print("(unreadable)"); sys.exit(0)
+parts = []
+for p in d:
+  st = (p.get("pm2_env") or {}).get("status","?")
+  name = p.get("name","?")
+  emoji = "🟢" if st == "online" else "🔴"
+  parts.append("{} {}".format(emoji, name))
+print(" ".join(parts) if parts else "(none)")
+')
+fi
+
+# systemd services from config
+SVC_LINE=""
+for SVC in ${SYSTEMD_SERVICES:-}; do
+  ST=$(systemctl is-active "$SVC" 2>&1)
+  EMOJI="🟢"; [ "$ST" != "active" ] && EMOJI="🔴"
+  SVC_LINE="$SVC_LINE$EMOJI $SVC "
+done
+
+# fail2ban + auth
+F2B_BAN=$(fail2ban-client status sshd 2>/dev/null | awk -F'\t+' '/Currently banned/ {print $2}')
+F2B_TOTAL=$(fail2ban-client status sshd 2>/dev/null | awk -F'\t+' '/Total banned/ {print $2}')
+SSH_FAILED_24H=$(awk -v cutoff="$(date -d '-24 hours' '+%s')" '
+  { cmd="date -d \""$1" "$2" "$3"\" +%s 2>/dev/null"; cmd | getline t; close(cmd); if (t >= cutoff && /Failed password|Invalid user/) c++ }
+  END {print c+0}
+' /var/log/auth.log 2>/dev/null)
+SSH_OK_24H=$(awk -v cutoff="$(date -d '-24 hours' '+%s')" '
+  { cmd="date -d \""$1" "$2" "$3"\" +%s 2>/dev/null"; cmd | getline t; close(cmd); if (t >= cutoff && /Accepted (password|publickey)/) c++ }
+  END {print c+0}
+' /var/log/auth.log 2>/dev/null)
+# Top 3 unique IPs that successfully logged in in last 24h
+SSH_OK_IPS=$(awk -v cutoff="$(date -d '-24 hours' '+%s')" '
+  { cmd="date -d \""$1" "$2" "$3"\" +%s 2>/dev/null"; cmd | getline t; close(cmd); if (t >= cutoff && /Accepted (password|publickey)/) {for (i=1;i<=NF;i++) if ($i=="from") print $(i+1)} }
+' /var/log/auth.log 2>/dev/null | sort | uniq -c | sort -rn | head -3 | awk '{printf "  • %s (%dx)\n", $2, $1}')
+[ -z "$SSH_OK_IPS" ] && SSH_OK_IPS="  • (none)"
+
+# nginx
+NGX_LINE=""
+if [ -r /var/log/nginx/access.log ]; then
+  NGX_5XX=$(awk '$9 ~ /^5/ {c++} END{print c+0}' /var/log/nginx/access.log 2>/dev/null)
+  NGX_4XX=$(awk '$9 ~ /^4/ {c++} END{print c+0}' /var/log/nginx/access.log 2>/dev/null)
+  NGX_2XX=$(awk '$9 ~ /^2/ {c++} END{print c+0}' /var/log/nginx/access.log 2>/dev/null)
+  NGX_LINE="
+🌐 nginx access.log totals (since rotation):
+   • 2xx: $NGX_2XX  • 4xx: $NGX_4XX  • 5xx: $NGX_5XX
+"
+fi
+
+# TLS certs
+CERT_LINE=""
+for DOMAIN in $TLS_DOMAINS; do
+  CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+  [ -r "$CERT" ] || continue
+  END_EPOCH=$(date -d "$(openssl x509 -in "$CERT" -noout -enddate | cut -d= -f2)" +%s 2>/dev/null || echo 0)
+  [ "$END_EPOCH" -gt 0 ] || continue
+  CERT_DAYS=$(( (END_EPOCH - $(date +%s)) / 86400 ))
+  CERT_EMOJI="🔐"
+  [ "$CERT_DAYS" -le 30 ] && CERT_EMOJI="⚠️"
+  [ "$CERT_DAYS" -le 14 ] && CERT_EMOJI="🚨"
+  CERT_LINE="$CERT_LINE
+$CERT_EMOJI TLS $DOMAIN: $CERT_DAYS days"
+done
+
+UPGRADABLE=$(apt list --upgradable 2>/dev/null | grep -vc 'Listing')
+DISK_EMOJI="💾"; [ "${DISK_USED:-0}" -ge 75 ] && DISK_EMOJI="⚠️"; [ "${DISK_USED:-0}" -ge 85 ] && DISK_EMOJI="🚨"
+
+MSG="📊 DAILY SUMMARY — $HOST
+🕒 $DATE
+⏱  Uptime: $UPTIME
+
+${PM2_LINE:+$PM2_LINE
+}${SVC_LINE:+$SVC_LINE
+}$DISK_EMOJI Disk /: $DISK_LINE
+🧠 Mem: $MEM_LINE  •  📈 Load: $LOAD$CERT_LINE
+
+🛡  fail2ban (sshd): ${F2B_BAN:-0} now / ${F2B_TOTAL:-0} total
+📡 SSH 24h: ${SSH_FAILED_24H:-0} failed, ${SSH_OK_24H:-0} accepted
+   Successful from:
+$SSH_OK_IPS
+$NGX_LINE
+📦 apt upgradable: $UPGRADABLE"
+
+/usr/local/bin/tg-notify "$MSG" || true

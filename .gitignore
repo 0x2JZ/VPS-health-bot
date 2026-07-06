@@ -1,0 +1,7 @@
+# Never commit real config — it contains your bot token and trusted IPs.
+config.env
+known-ips
+*.env
+!config/config.env.example
+__pycache__/
+*.pyc

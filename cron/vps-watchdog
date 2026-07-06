@@ -1,0 +1,8 @@
+# /etc/cron.d/vps-watchdog -- VPS health monitoring via Telegram
+# Health checks every 5 min; integrity scan hourly; daily summary 09:00 local.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+*/5 * * * * root /usr/local/bin/vps-healthcheck      >/dev/null 2>&1
+17  * * * * root /usr/local/bin/vps-integrity-check  >/dev/null 2>&1
+0   9 * * * root /usr/local/bin/vps-daily-summary    >/dev/null 2>&1

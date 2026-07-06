@@ -1,0 +1,94 @@
+#!/bin/bash
+# ssh-login-notify — invoked by PAM session-open on sshd. Sends a Telegram
+# alert for every successful SSH login. Marks logins from unknown IPs as 🚨.
+# Configured via: session optional pam_exec.so /usr/local/bin/ssh-login-notify
+#
+# PAM env vars (provided automatically):
+#   PAM_USER, PAM_RHOST, PAM_TYPE, PAM_SERVICE, PAM_TTY
+# We only fire on PAM_TYPE=open_session to avoid duplicates.
+
+set -u
+[ "${PAM_TYPE:-}" = "open_session" ] || exit 0
+[ "${PAM_SERVICE:-}" = "sshd" ] || exit 0
+
+ENV_FILE=${VPS_WATCHDOG_CONFIG:-/etc/vps-watchdog/config.env}
+# shellcheck disable=SC1090
+[ -r "$ENV_FILE" ] && . "$ENV_FILE"
+
+USER=${PAM_USER:-?}
+RHOST=${PAM_RHOST:-?}
+TTY=${PAM_TTY:-?}
+HOST=$(hostname -s)
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')
+KNOWN_IPS=${KNOWN_IPS_FILE:-/etc/vps-watchdog/known-ips}
+LOG_FILE=/var/log/auth.log
+
+# Determine auth method by grepping the most recent matching auth.log line.
+# Small race window, but PAM hooks run AFTER the "Accepted ..." log line.
+METHOD="unknown"
+if [ -r "$LOG_FILE" ] && [ "$RHOST" != "?" ]; then
+  RECENT=$(tac "$LOG_FILE" 2>/dev/null | grep -m1 -E "Accepted (password|publickey) for $USER from $RHOST" 2>/dev/null || true)
+  case "$RECENT" in
+    *"Accepted publickey"*) METHOD="publickey" ;;
+    *"Accepted password"*)  METHOD="password" ;;
+  esac
+fi
+
+# Trust check
+TRUSTED=no
+if [ -r "$KNOWN_IPS" ] && [ "$RHOST" != "?" ]; then
+  if grep -qxE "[[:space:]]*$(printf '%s' "$RHOST" | sed 's/[][\\/.^$*]/\\&/g')[[:space:]]*" "$KNOWN_IPS" 2>/dev/null; then
+    TRUSTED=yes
+  fi
+fi
+
+# Active sessions count
+ACTIVE=$(who 2>/dev/null | wc -l)
+
+# Method emoji + user emoji
+case "$METHOD" in
+  publickey) METHOD_EMOJI="🔑" ;;
+  password)  METHOD_EMOJI="🔓" ;;
+  *)         METHOD_EMOJI="❓" ;;
+esac
+case "$USER" in
+  root)      USER_EMOJI="👑" ;;
+  *)         USER_EMOJI="👤" ;;
+esac
+
+if [ "$TRUSTED" = "yes" ]; then
+  HEADER="✅ SSH LOGIN — $HOST"
+  TRUST_LINE="🟢 Source: TRUSTED IP"
+else
+  HEADER="🚨 SSH LOGIN (UNKNOWN IP) — $HOST"
+  TRUST_LINE="⚠️ Source: NOT in known-ips list"
+fi
+
+# Heads-up if root login by password
+EXTRA=""
+if [ "$USER" = "root" ] && [ "$METHOD" = "password" ]; then
+  EXTRA="
+🔥 root login via PASSWORD — verify this was you"
+fi
+
+# Count prior failed attempts from this IP in the current auth.log (post-rotation).
+# grep -c exits 1 when there are no matches, so handle that explicitly.
+RECENT_FAILED=$(grep -cE "Failed password.*from $RHOST" "$LOG_FILE" 2>/dev/null) || RECENT_FAILED=0
+FAIL_LINE=""
+if [ "$RECENT_FAILED" -gt 0 ] 2>/dev/null; then
+  FAIL_LINE="
+📉 Prior failed attempts from this IP in current log: $RECENT_FAILED"
+fi
+
+MSG="$HEADER
+$USER_EMOJI User: $USER
+$METHOD_EMOJI Method: $METHOD
+🌐 From: $RHOST
+🖥  TTY: $TTY
+🕒 $TIMESTAMP
+👥 Active sessions now: $ACTIVE
+$TRUST_LINE$EXTRA$FAIL_LINE"
+
+# Best-effort, don't break login if Telegram is down
+/usr/local/bin/tg-notify "$MSG" >/dev/null 2>&1 || true
+exit 0

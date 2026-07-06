@@ -1,0 +1,134 @@
+#!/bin/bash
+# vps-integrity-check — hourly cron. Detects tampering on critical files
+# and changes to the listening-port surface. Alerts to Telegram with a diff
+# whenever something changes since last run.
+#
+# State stored in /var/lib/vps-watchdog/integrity/.
+
+set -u
+ENV_FILE=${VPS_WATCHDOG_CONFIG:-/etc/vps-watchdog/config.env}
+# shellcheck disable=SC1090
+[ -r "$ENV_FILE" ] && . "$ENV_FILE"
+
+STATE_DIR=/var/lib/vps-watchdog/integrity
+HOST=$(hostname -s)
+mkdir -p "$STATE_DIR"
+
+# Files to fingerprint. Each file is hashed; we track full content so we can diff.
+WATCH_FILES=(
+  /etc/passwd
+  /etc/shadow
+  /etc/group
+  /etc/sudoers
+  /etc/ssh/sshd_config
+  /etc/crontab
+  /etc/aliases
+)
+
+# Extra files from config (space-separated)
+for f in ${WATCH_FILES_EXTRA:-}; do WATCH_FILES+=("$f"); done
+
+# Globs (each match is its own watched file)
+WATCH_GLOBS=(
+  '/root/.ssh/authorized_keys'
+  '/home/*/.ssh/authorized_keys'
+  '/etc/sudoers.d/*'
+  '/etc/ssh/sshd_config.d/*'
+  '/etc/cron.d/*'
+  '/etc/cron.daily/*'
+  '/etc/cron.hourly/*'
+  '/var/spool/cron/crontabs/*'
+  '/etc/nginx/sites-enabled/*'
+)
+
+# Build full file list
+declare -a ALL_FILES
+for f in "${WATCH_FILES[@]}"; do ALL_FILES+=("$f"); done
+for g in "${WATCH_GLOBS[@]}"; do
+  for f in $g; do [ -e "$f" ] && ALL_FILES+=("$f"); done
+done
+
+# Listening-port snapshot (one normalized line per port)
+PORT_FILE_NEW="$STATE_DIR/_ports.new"
+PORT_FILE_OLD="$STATE_DIR/_ports.old"
+ss -tulnH 2>/dev/null | awk '{print $1, $5}' | sort -u > "$PORT_FILE_NEW"
+
+# UFW state snapshot — strip rule numbers (they shift on every fail2ban
+# add/remove), drop transient fail2ban single-IP REJECT bans, then sort so
+# only real policy changes trigger an alert.
+UFW_FILE_NEW="$STATE_DIR/_ufw.new"
+UFW_FILE_OLD="$STATE_DIR/_ufw.old"
+ufw status numbered 2>/dev/null \
+  | sed -E 's/^\[[[:space:]]*[0-9]+\][[:space:]]*//' \
+  | sed -E 's/[[:space:]]+/ /g; s/[[:space:]]*$//' \
+  | grep -vE '^Anywhere(\(v6\))? REJECT IN [0-9a-fA-F:.]+(/[0-9]+)?$' \
+  | sort -u > "$UFW_FILE_NEW"
+
+# /etc/passwd users-with-shell snapshot
+USERS_FILE_NEW="$STATE_DIR/_users.new"
+USERS_FILE_OLD="$STATE_DIR/_users.old"
+getent passwd | awk -F: '$7 ~ /(bash|zsh|sh)$/ {print $1":"$3":"$6":"$7}' | sort > "$USERS_FILE_NEW"
+
+ALERTS=""
+
+emit_alert() {
+  local title=$1 body=$2
+  ALERTS="${ALERTS}
+${title}
+${body}
+"
+}
+
+diff_file() {
+  local label=$1 newfile=$2 oldfile=$3
+  if [ -f "$oldfile" ]; then
+    DIFF=$(diff -u "$oldfile" "$newfile" 2>/dev/null | head -40)
+    if [ -n "$DIFF" ]; then
+      emit_alert "🚨 ${label} CHANGED" "$DIFF"
+    fi
+  fi
+  mv "$newfile" "$oldfile"
+}
+
+diff_file "🌐 Listening ports"  "$PORT_FILE_NEW"  "$PORT_FILE_OLD"
+diff_file "🛡  UFW rules"        "$UFW_FILE_NEW"   "$UFW_FILE_OLD"
+diff_file "👥 Shell users"       "$USERS_FILE_NEW" "$USERS_FILE_OLD"
+
+# Per-file fingerprints
+for f in "${ALL_FILES[@]}"; do
+  [ -r "$f" ] || continue
+  KEY=$(echo "$f" | sed 's|/|_|g')
+  HASH_OLD_FILE="$STATE_DIR/${KEY}.hash"
+  CONTENT_OLD_FILE="$STATE_DIR/${KEY}.content"
+  HASH_NEW=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+  if [ -f "$HASH_OLD_FILE" ]; then
+    HASH_OLD=$(cat "$HASH_OLD_FILE")
+    if [ "$HASH_NEW" != "$HASH_OLD" ]; then
+      DIFF=$(diff -u "$CONTENT_OLD_FILE" "$f" 2>/dev/null | head -40)
+      emit_alert "🚨 FILE CHANGED: $f" "$DIFF"
+    fi
+  fi
+  echo "$HASH_NEW" > "$HASH_OLD_FILE"
+  cp -f "$f" "$CONTENT_OLD_FILE" 2>/dev/null || true
+done
+
+# Detect new files in watched glob dirs (compare current fingerprint set vs prior list)
+LIST_NEW="$STATE_DIR/_filelist.new"
+LIST_OLD="$STATE_DIR/_filelist.old"
+printf '%s\n' "${ALL_FILES[@]}" | sort -u > "$LIST_NEW"
+if [ -f "$LIST_OLD" ]; then
+  DIFF=$(diff -u "$LIST_OLD" "$LIST_NEW" 2>/dev/null | head -40)
+  if [ -n "$DIFF" ]; then
+    emit_alert "🚨 WATCHED FILE SET CHANGED" "$DIFF"
+  fi
+fi
+mv "$LIST_NEW" "$LIST_OLD"
+
+# Send alert(s) if any
+if [ -n "$ALERTS" ]; then
+  HEADER="🚨 INTEGRITY ALERT — $HOST
+🕒 $(date '+%Y-%m-%d %H:%M %Z')
+The following changes were detected on critical files / surface:
+"
+  /usr/local/bin/tg-notify "${HEADER}${ALERTS}" || true
+fi

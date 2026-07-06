@@ -1,0 +1,209 @@
+#!/bin/bash
+# vps-healthcheck — runs every 5 min via /etc/cron.d/vps-watchdog.
+# Alerts to Telegram on state transitions OK<->FAIL for:
+#   1. PM2 processes online (if enabled/installed)
+#   2. Configured systemd services active
+#   3. Disk usage on / under DISK_THRESHOLD
+#   4. Memory usage under MEM_THRESHOLD (if set)
+#   5. TLS certs for TLS_DOMAINS with >TLS_CERT_WARN_DAYS remaining
+# Persistent failures re-alert every RE_ALERT_HOURS. State in /var/lib/vps-watchdog.
+
+set -u
+ENV_FILE=${VPS_WATCHDOG_CONFIG:-/etc/vps-watchdog/config.env}
+# shellcheck disable=SC1090
+[ -r "$ENV_FILE" ] && . "$ENV_FILE"
+
+STATE_DIR=/var/lib/vps-watchdog
+STATE_FILE="$STATE_DIR/state"
+HOST=$(hostname -s)
+mkdir -p "$STATE_DIR"
+touch "$STATE_FILE"
+
+DISK_THRESHOLD=${DISK_THRESHOLD:-85}
+RE_ALERT_SECS=$(( ${RE_ALERT_HOURS:-6} * 3600 ))
+MONITOR_PM2=${MONITOR_PM2:-auto}
+PM2_PROCESSES=${PM2_PROCESSES:-}
+SYSTEMD_SERVICES=${SYSTEMD_SERVICES:-}
+TLS_DOMAINS=${TLS_DOMAINS:-}
+TLS_CERT_WARN_DAYS=${TLS_CERT_WARN_DAYS:-14}
+MEM_THRESHOLD=${MEM_THRESHOLD:-}
+NOW=$(date +%s)
+
+notify() { /usr/local/bin/tg-notify "$1" || true; }
+
+prev_state() { grep -E "^${1}=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2-; }
+prev_time()  { grep -E "^${1}_t=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2-; }
+write_state() {
+  local k=$1 v=$2 t=$3
+  grep -vE "^${k}(_t)?=" "$STATE_FILE" 2>/dev/null > "$STATE_FILE.tmp" || true
+  printf '%s=%s\n%s_t=%s\n' "$k" "$v" "$k" "$t" >> "$STATE_FILE.tmp"
+  mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+handle() {
+  local key=$1 new=$2 fail_msg=$3 ok_msg=$4
+  local old; old=$(prev_state "$key")
+  local last_t; last_t=$(prev_time "$key")
+  [ -z "$old" ] && old=OK
+
+  if [ "$old" != "$new" ]; then
+    if [ "$new" = "FAIL" ]; then notify "$fail_msg"; else notify "$ok_msg"; fi
+    write_state "$key" "$new" "$NOW"
+  elif [ "$new" = "FAIL" ] && [ -n "$last_t" ] && [ $((NOW - last_t)) -ge $RE_ALERT_SECS ]; then
+    notify "🔁 [reminder] $fail_msg"
+    write_state "$key" "$new" "$NOW"
+  fi
+}
+
+# 1. PM2 ----------------------------------------------------------------------
+PM2_ENABLED=no
+case "$MONITOR_PM2" in
+  yes) PM2_ENABLED=yes ;;
+  auto) command -v pm2 >/dev/null 2>&1 && PM2_ENABLED=yes ;;
+esac
+
+if [ "$PM2_ENABLED" = "yes" ]; then
+  PM2_OUT=$(pm2 jlist 2>/dev/null || echo "[]")
+  PM2_REPORT=$(echo "$PM2_OUT" | WATCH="$PM2_PROCESSES" python3 -c '
+import sys, json, os
+watch = set(os.environ.get("WATCH", "").split())
+try:
+  data = json.load(sys.stdin)
+except Exception:
+  print("PARSE_ERROR|"); sys.exit(0)
+lines, bad = [], []
+for p in data:
+  name = p.get("name", "?")
+  if watch and name not in watch:
+    continue
+  st = (p.get("pm2_env") or {}).get("status", "?")
+  restarts = (p.get("pm2_env") or {}).get("restart_time", 0)
+  emoji = "🟢" if st == "online" else "🔴"
+  lines.append("{} {} ({}, ↺{})".format(emoji, name, st, restarts))
+  if st != "online":
+    bad.append("{}={}".format(name, st))
+seen = {l.split()[1] for l in lines}
+for w in sorted(watch - seen):
+  lines.append("🔴 {} (missing)".format(w)); bad.append("{}=missing".format(w))
+status = "OK" if not bad else "FAIL"
+print("{}|{}|{}".format(status, ", ".join(bad), "\n".join(lines)))
+' 2>/dev/null)
+
+  PM2_STATUS=${PM2_REPORT%%|*}
+  PM2_REST=${PM2_REPORT#*|}
+  PM2_DOWN=${PM2_REST%%|*}
+  PM2_DETAILS=${PM2_REST#*|}
+
+  if [ "$PM2_STATUS" = "PARSE_ERROR" ] || [ -z "$PM2_OUT" ]; then
+    handle pm2 FAIL \
+      "🚨 VPS ALERT — $HOST
+🔴 PM2: cannot read process list
+• 'pm2 jlist' returned empty/error
+• Action: SSH in and run 'pm2 status'" \
+      "✅ VPS RECOVERED — $HOST
+🟢 PM2 process list readable again"
+  elif [ "$PM2_STATUS" = "FAIL" ]; then
+    handle pm2 FAIL \
+      "🚨 VPS ALERT — $HOST
+🔴 PM2 service offline
+• Down: $PM2_DOWN
+• Status:
+$PM2_DETAILS
+• Action: pm2 logs --err --lines 30" \
+      "✅ VPS RECOVERED — $HOST
+🟢 PM2 services back online
+$PM2_DETAILS"
+  else
+    handle pm2 OK "" \
+      "✅ VPS RECOVERED — $HOST
+🟢 PM2 services back online
+$PM2_DETAILS"
+  fi
+fi
+
+# 2. systemd services -----------------------------------------------------------
+for SVC in $SYSTEMD_SERVICES; do
+  ST=$(systemctl is-active "$SVC" 2>&1)
+  if [ "$ST" = "active" ]; then
+    handle "svc_$SVC" OK "" \
+      "✅ VPS RECOVERED — $HOST
+🟢 systemd: $SVC active again"
+  else
+    handle "svc_$SVC" FAIL \
+      "🚨 VPS ALERT — $HOST
+🔴 systemd: $SVC is $ST
+• Action: journalctl -u $SVC -n 30" \
+      "✅ VPS RECOVERED — $HOST
+🟢 systemd: $SVC active again"
+  fi
+done
+
+# 3. Disk ---------------------------------------------------------------------
+USED=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+DISK_LINE=$(df -h / | tail -1 | awk '{print $3"/"$2" used ("$5"), "$4" free"}')
+TOP_DIRS=$(du -sh /var/log /var/lib /opt /home /tmp 2>/dev/null | sort -rh | head -3 | awk '{print "  • " $0}')
+
+if [ "${USED:-0}" -ge "$DISK_THRESHOLD" ]; then
+  handle disk FAIL \
+    "🚨 VPS ALERT — $HOST
+💾 Disk near full
+• /: $DISK_LINE
+• Top consumers:
+$TOP_DIRS
+• Action: investigate the top consumers above" \
+    "✅ VPS RECOVERED — $HOST
+💾 Disk: / back below ${DISK_THRESHOLD}%
+• /: $DISK_LINE"
+else
+  handle disk OK "" \
+    "✅ VPS RECOVERED — $HOST
+💾 Disk: / back below ${DISK_THRESHOLD}%
+• /: $DISK_LINE"
+fi
+
+# 4. Memory (optional) -----------------------------------------------------------
+if [ -n "$MEM_THRESHOLD" ]; then
+  MEM_PCT=$(free | awk '/Mem:/ {printf "%d", $3/$2*100}')
+  MEM_LINE=$(free -h | awk '/Mem:/ {print $3"/"$2}')
+  if [ "${MEM_PCT:-0}" -ge "$MEM_THRESHOLD" ]; then
+    handle mem FAIL \
+      "🚨 VPS ALERT — $HOST
+🧠 Memory usage high
+• Used: $MEM_LINE (${MEM_PCT}%)
+• Action: ps aux --sort=-%mem | head" \
+      "✅ VPS RECOVERED — $HOST
+🧠 Memory back below ${MEM_THRESHOLD}% ($MEM_LINE)"
+  else
+    handle mem OK "" \
+      "✅ VPS RECOVERED — $HOST
+🧠 Memory back below ${MEM_THRESHOLD}% ($MEM_LINE)"
+  fi
+fi
+
+# 5. TLS certs -----------------------------------------------------------------
+for DOMAIN in $TLS_DOMAINS; do
+  CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+  [ -r "$CERT" ] || continue
+  END_EPOCH=$(date -d "$(openssl x509 -in "$CERT" -noout -enddate | cut -d= -f2)" +%s 2>/dev/null || echo 0)
+  [ "$END_EPOCH" -gt 0 ] || continue
+  DAYS=$(( (END_EPOCH - NOW) / 86400 ))
+  EXPIRY_DATE=$(date -d "@$END_EPOCH" '+%Y-%m-%d')
+  TIMER_STATE=$(systemctl is-active certbot.timer 2>&1)
+  if [ "$DAYS" -le "$TLS_CERT_WARN_DAYS" ]; then
+    handle "cert_$DOMAIN" FAIL \
+      "🚨 VPS ALERT — $HOST
+🔐 TLS cert expiring soon
+• Domain: $DOMAIN
+• Days left: $DAYS (expires $EXPIRY_DATE)
+• certbot.timer: $TIMER_STATE
+• Action: certbot renew --dry-run; check journalctl -u certbot" \
+      "✅ VPS RECOVERED — $HOST
+🔐 TLS cert renewed ($DOMAIN)
+• Days left: $DAYS"
+  else
+    handle "cert_$DOMAIN" OK "" \
+      "✅ VPS RECOVERED — $HOST
+🔐 TLS cert renewed ($DOMAIN)
+• Days left: $DAYS"
+  fi
+done

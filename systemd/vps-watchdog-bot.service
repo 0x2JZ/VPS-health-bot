@@ -1,0 +1,16 @@
+[Unit]
+Description=Interactive Telegram bot for the VPS watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vps-watchdog-bot
+Restart=always
+RestartSec=5
+# Needs root to read auth.log, manage fail2ban/known-ips, restart services.
+User=root
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,42 @@
+#!/bin/bash
+# tg-notify "<message>"  -- send a Telegram message via the watchdog bot.
+# Reads token + chat_id from /etc/vps-watchdog/config.env (mode 600).
+# Honors the mute flag set from the bot menu (/var/lib/vps-watchdog/mute-until).
+# Exits 0 on success, non-zero on failure (caller can chain with || true).
+
+set -u
+ENV_FILE=${VPS_WATCHDOG_CONFIG:-/etc/vps-watchdog/config.env}
+[ -r "$ENV_FILE" ] || { echo "tg-notify: $ENV_FILE missing or unreadable" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+: "${TG_BOT_TOKEN:?TG_BOT_TOKEN not set in $ENV_FILE}"
+: "${TG_CHAT_ID:?TG_CHAT_ID not set in $ENV_FILE}"
+
+MSG="${1:-}"
+if [ -z "$MSG" ]; then
+  MSG="$(cat)"
+fi
+[ -n "$MSG" ] || { echo "tg-notify: empty message" >&2; exit 1; }
+
+# Mute flag: bot writes an epoch timestamp; suppress alerts until then.
+# Pass --force (as $2 or $1) to bypass, e.g. for the unmute confirmation itself.
+MUTE_FILE=/var/lib/vps-watchdog/mute-until
+if [ "${2:-}" != "--force" ] && [ -r "$MUTE_FILE" ]; then
+  MUTE_UNTIL=$(cat "$MUTE_FILE" 2>/dev/null || echo 0)
+  if [ "$(date +%s)" -lt "${MUTE_UNTIL:-0}" ] 2>/dev/null; then
+    exit 0
+  fi
+fi
+
+# Telegram caps a single message at 4096 chars; truncate with a marker.
+if [ "${#MSG}" -gt 4000 ]; then
+  MSG="${MSG:0:3950}
+... [truncated]"
+fi
+
+curl -sS --max-time 15 -X POST \
+  "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+  --data-urlencode "chat_id=${TG_CHAT_ID}" \
+  --data-urlencode "text=${MSG}" \
+  --data-urlencode "disable_web_page_preview=true" \
+  >/dev/null
