@@ -43,8 +43,8 @@ Only your Telegram chat id can use the bot; all other users are ignored.
 # 2. Get your chat id: message @userinfobot (or send your bot a message and
 #    open https://api.telegram.org/bot<TOKEN>/getUpdates in a browser).
 
-git clone https://github.com/<you>/vps-telegram-watchdog.git
-cd vps-telegram-watchdog
+git clone https://github.com/0x2JZ/VPS-health-bot.git
+cd VPS-health-bot
 sudo bash install.sh
 
 sudo nano /etc/vps-watchdog/config.env    # set TG_BOT_TOKEN and TG_CHAT_ID
