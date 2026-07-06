@@ -128,6 +128,13 @@ def answer_cb(cb_id, text=""):
              timeout=10)
 
 
+def delete(chat_id, message_id):
+    """Delete the app-window message; Telegram refuses after ~48h."""
+    r = api_call("deleteMessage", {"chat_id": chat_id, "message_id": message_id},
+                 timeout=10)
+    return bool(r and r.get("ok"))
+
+
 # --------------------------------------------------------------------------- shell helpers
 
 def sh(cmd, timeout=30):
@@ -253,7 +260,8 @@ def scr_menu():
          {"text": "⚙️ Services", "callback_data": "nav:services"}],
         [{"text": "▶️ Run checks", "callback_data": "nav:checks"},
          {"text": "🔇 Mute", "callback_data": "nav:mute"}],
-        [{"text": "ℹ️ Help", "callback_data": "nav:help"}],
+        [{"text": "ℹ️ Help", "callback_data": "nav:help"},
+         {"text": "❌ Close", "callback_data": "close"}],
     ]
     return text, kb
 
@@ -393,7 +401,8 @@ def scr_help():
               "alerts on every SSH login, and this menu lets you inspect the box "
               "and manage the trusted-IP whitelist.\n\n<b>Commands</b>\n" + cmds
             + "\n\nButtons edit this message in place — use ☰ next to the input "
-              "box or /menu to come back here.")
+              "box or /menu to come back here. ❌ Close on the main menu "
+              "dismisses this message from the chat.")
     return text, []
 
 
@@ -448,7 +457,13 @@ def handle_callback(cb):
     data = cb.get("data", "")
     answer_cb(cb["id"], "Running checks…" if data == "nav:checks" else "")
 
-    if data.startswith("nav:"):
+    if data == "close":
+        PENDING.pop(chat_id, None)
+        if not delete(chat_id, msg_id):
+            # Too old to delete — collapse to a stub with no keyboard instead.
+            edit(chat_id, msg_id,
+                 header("🤖 VPS Watchdog") + "\nMenu closed — send /menu to reopen.")
+    elif data.startswith("nav:"):
         name = data.split(":", 1)[1]
         if name in SCREENS:
             PENDING.pop(chat_id, None)
